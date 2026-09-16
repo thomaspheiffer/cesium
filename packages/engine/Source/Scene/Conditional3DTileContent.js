@@ -1072,6 +1072,36 @@ class ContentHandle {
   }
 
   /**
+   * Like {@link reset}, but defers only the content destruction to the end of
+   * the frame.
+   *
+   * Eviction runs inside update(), before the frame's command list executes,
+   * so destroying the content here can free a VertexArray that a queued
+   * DrawCommand still references. Everything else - cancelling the request and
+   * clearing handle state - must stay synchronous, otherwise the tileset's
+   * pending-request statistics drift (observed as negative pending counts and
+   * an allTilesLoaded event that never fires).
+   *
+   * @param {FrameState} frameState The frame state of the running update
+   */
+  resetDeferringDestroy(frameState) {
+    if (defined(this._requestHandle)) {
+      this._requestHandle.cancel();
+    }
+    this._requestHandle = undefined;
+    const content = this._content;
+    if (defined(content)) {
+      this._fireContentUnloaded(content);
+      frameState.afterRender.push(() => {
+        content.destroy();
+      });
+    }
+    this._content = undefined;
+    this._failed = false;
+    this._deferred = defer();
+  }
+
+  /**
    * Wrapper around content.update, for implementing the
    * Cesium3DTileContent interface...
    *
@@ -1314,7 +1344,8 @@ class Conditional3DTileContent {
      */
     this._loadedContentHandles = new LRUCache(
       Number.POSITIVE_INFINITY,
-      this.loadedContentHandleEvicted,
+      (uri, contentHandle) =>
+        this.loadedContentHandleEvicted(uri, contentHandle),
     );
 
     /**
@@ -1329,6 +1360,17 @@ class Conditional3DTileContent {
      * @type {number}
      */
     this._loadedContentHandlesMaximumSize = 10;
+
+    /**
+     * The frame state of the update that is currently running, if any.
+     *
+     * Eviction destroys GPU resources that the current frame's command list
+     * may still reference, so the destroy is deferred to 'afterRender'.
+     *
+     * @type {FrameState|undefined}
+     * @private
+     */
+    this._updatingFrameState = undefined;
 
     /**
      * The last style that was applied to this content.
@@ -1358,6 +1400,17 @@ class Conditional3DTileContent {
   loadedContentHandleEvicted(uri, contentHandle) {
     if (CONDITIONAL_CONTENT_LOGGING) {
       console.log(`_loadedContentHandleEvicted with ${uri}`);
+    }
+    // Eviction runs inside update(), before the frame's command list
+    // executes, so destroying the content here can free a VertexArray that a
+    // queued DrawCommand still references and halt the render loop. Defer the
+    // destroy to after the frame, the way Cesium3DTileset unloads its own
+    // cache from postPassesUpdate. Only the destroy is deferred; see
+    // resetDeferringDestroy.
+    const frameState = this._updatingFrameState;
+    if (defined(frameState)) {
+      contentHandle.resetDeferringDestroy(frameState);
+      return;
     }
     contentHandle.reset();
   }
@@ -1951,7 +2004,7 @@ class Conditional3DTileContent {
         );
       }
     }
-    this._unloadOldContent();
+    this._unloadOldContent(frameState);
   }
 
   /**
@@ -1965,7 +2018,7 @@ class Conditional3DTileContent {
    * to this size, evicting (i.e. unloading the content of) the entries
    * that have been least recently used.
    */
-  _unloadOldContent() {
+  _unloadOldContent(frameState) {
     // Iterate over all content handles. If the content of a certain handle
     // is currently loaded, then store it in the loadedContentHandles.
     const contentHandleEntries = this._contentHandles.entries();
@@ -1999,7 +2052,12 @@ class Conditional3DTileContent {
     // Trim the LRU cache to the target size, calling the
     // '_loadedContentHandleEvicted' for the least recently
     // used content handles.
-    loadedContentHandles.trimToSize(this._loadedContentHandlesMaximumSize);
+    this._updatingFrameState = frameState;
+    try {
+      loadedContentHandles.trimToSize(this._loadedContentHandlesMaximumSize);
+    } finally {
+      this._updatingFrameState = undefined;
+    }
   }
 
   /**
