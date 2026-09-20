@@ -763,6 +763,14 @@ class ContentHandle {
     this._content = undefined;
 
     /**
+     * The style most recently handed to the content, used to skip redundant
+     * re-application. See applyStyleIfChanged.
+     *
+     * @type {Cesium3DTileStyle|undefined|object}
+     */
+    this._lastAppliedStyle = CONDITIONAL_CONTENT_STYLE_NOT_APPLIED;
+
+    /**
      * Whether the content creation failed.
      *
      * See 'get failed()' for details.
@@ -1067,6 +1075,7 @@ class ContentHandle {
       this._content.destroy();
     }
     this._content = undefined;
+    this._lastAppliedStyle = CONDITIONAL_CONTENT_STYLE_NOT_APPLIED;
     this._failed = false;
     this._deferred = defer();
   }
@@ -1097,8 +1106,33 @@ class ContentHandle {
       });
     }
     this._content = undefined;
+    this._lastAppliedStyle = CONDITIONAL_CONTENT_STYLE_NOT_APPLIED;
     this._failed = false;
     this._deferred = defer();
+  }
+
+  /**
+   * Apply a style to this handle's content, skipping the call when that style
+   * is already in effect.
+   *
+   * Setting a style on a content marks the model's style dirty, and the model
+   * rebuilds its draw commands - destroying and recreating pipeline resources
+   * - the next time it processes that flag. The style is otherwise re-applied
+   * to every loaded content on every frame, so without this guard every
+   * variant of every visible tile rebuilds its pipeline every frame.
+   *
+   * @param {Cesium3DTileStyle|undefined} style The style
+   */
+  applyStyleIfChanged(style) {
+    const content = this._content;
+    if (!defined(content)) {
+      return;
+    }
+    if (this._lastAppliedStyle === style) {
+      return;
+    }
+    this._lastAppliedStyle = style;
+    content.applyStyle(style);
   }
 
   /**
@@ -1148,6 +1182,11 @@ class ContentHandle {
 
 // XXX_CONDITIONAL See where to put these. Should be static
 // properties, but eslint complains about that.
+// Sentinel for "no style has been applied to this content yet", so that the
+// memo in ContentHandle.applyStyleIfChanged can tell that case apart from an
+// undefined style having been applied deliberately.
+const CONDITIONAL_CONTENT_STYLE_NOT_APPLIED = Object.freeze({});
+
 const CONDITIONAL_CONTENT_HIDE_STYLE = new Cesium3DTileStyle({
   show: false,
 });
@@ -1940,56 +1979,46 @@ class Conditional3DTileContent {
   }
 
   /**
+   * Show the active contents and hide the rest.
+   *
+   * There is no per-content show flag to drive here: whether a content is
+   * drawn depends on whether its model schedules draw commands, so visibility
+   * is expressed through the style.
+   *
+   * Only contents whose style actually changed are touched, because applying
+   * a style costs the model a full pipeline rebuild on its next update.
+   *
+   * @private
+   */
+  _applyStylesToContents() {
+    const activeContentUris = new Set(this._activeContentUris);
+    for (const [uri, contentHandle] of this._contentHandles.entries()) {
+      const style = activeContentUris.has(uri)
+        ? this._lastStyle
+        : CONDITIONAL_CONTENT_HIDE_STYLE;
+      contentHandle.applyStyleIfChanged(style);
+    }
+  }
+
+  /**
    * Part of the {@link Cesium3DTileContent} interface.
    *
    * @param {Cesium3DTileset} tileset The tileset containing this tile.
    * @param {FrameState} frameState The frame state.
    */
   update(tileset, frameState) {
+    // Style before updating the contents, not after. A content's applyStyle
+    // only marks the model's style dirty; the model processes that flag in
+    // its own update, and does so before it builds its draw commands. So a
+    // style set here takes effect in this frame, whereas one set after the
+    // update loop misses it - which leaves a content that first became ready
+    // during this frame rendering unstyled, and therefore visible, for a
+    // frame.
+    this._applyStylesToContents();
+
     // Call update for all contents
     for (const contentHandle of this._contentHandles.values()) {
       contentHandle.updateContent(tileset, frameState);
-    }
-
-    // There is no way to show or hide contents.
-    // Whether something is shown or not eventually depends
-    // on whether draw commands are scheduled. This happens
-    // as part of the "update" call. The "update" does not
-    // differentiate between "doing random stuff that has
-    // to be done somewhere", and scheduling the draw commands.
-    // It could be called "doRandomStuff" at this point.
-    //
-    // But wait, there's more:
-    //
-    // Setting the style on a content unleashes a cascade
-    // of things being marked as "dirty" and being "updated".
-    // As part of these "updates", the draw commands of the
-    // model are reset, and the effect of changes is only
-    // visible in the next frame. So setting the style in
-    // each frame will cause the models to no longer be
-    // rendered.
-    // One could set the style once, and only evaluate the
-    // 'show' condition. This should work, except for
-    // https://github.com/CesiumGS/cesium/issues/13346
-    // and the fact that the style is not re-evaluated unless
-    // it is marked as "dirty", which causes the aforementioned
-    // updates.
-    //
-    // No time for idealism: If there's a model, then hide
-    // or show it with the 'show' property. Otherwise, wait
-    // for the issues to come in.
-    // Works for me.
-
-    // Hide all contents.
-    const allLoadedContents = this._allLoadedContents;
-    for (const content of allLoadedContents) {
-      content.applyStyle(CONDITIONAL_CONTENT_HIDE_STYLE);
-    }
-
-    // Show only the active contents.
-    const activeContents = this._activeLoadedContents;
-    for (const activeContent of activeContents) {
-      activeContent.applyStyle(this._lastStyle);
     }
 
     // Assign debug settings to all active contents
