@@ -1412,6 +1412,19 @@ class Conditional3DTileContent {
     this._updatingFrameState = undefined;
 
     /**
+     * The content URIs that are currently being drawn.
+     *
+     * This trails the active URIs: when the condition selects contents that
+     * have not loaded yet, the previously drawn ones stay up rather than the
+     * tile going empty while the new ones arrive. See
+     * '_updateDisplayedContentUris'.
+     *
+     * @type {string[]}
+     * @private
+     */
+    this._displayedContentUris = [];
+
+    /**
      * The last style that was applied to this content.
      *
      * It will be applied to all "active" contents in the 'update'
@@ -1761,7 +1774,7 @@ class Conditional3DTileContent {
    * @returns The result
    */
   getAggregatedRendered(property) {
-    const allLoadedContents = this._activeLoadedContents;
+    const allLoadedContents = this._displayedLoadedContents;
     let result = 0;
     for (const content of allLoadedContents) {
       result += Conditional3DTileContent.getAggregated(content, property);
@@ -1833,15 +1846,38 @@ class Conditional3DTileContent {
   /**
    * Part of the {@link Cesium3DTileContent} interface.
    *
-   * For this class, this always returns "true". The inner contents
-   * may be ready or not, but their lifecycle is supposed to be
-   * managed by this class, when the "update" function is called.
+   * Reports whether the contents selected by the current condition have
+   * loaded. Reporting ready before that lets the traversal refine into this
+   * tile while it still has nothing to draw, which shows as a tile briefly
+   * going empty when the level of detail changes.
+   *
+   * This is also what drives the requests. A tile stays in the tileset's
+   * processing queue until its content reports ready, and that queue is
+   * pumped every frame whether or not the tile was selected for rendering -
+   * whereas 'update' only runs for selected tiles. So requesting here is what
+   * lets a tile load at all before it is renderable. 'tryGetContent' starts
+   * the request when there is not one already, and does not retry failures.
    *
    * @type {boolean}
    * @readonly
    */
   get ready() {
-    return true;
+    let ready = true;
+    for (const uri of this._activeContentUris) {
+      const contentHandle = this._contentHandles.get(uri);
+      // A missing or failed handle will never produce content, so waiting on
+      // it would strand the tile in the processing queue.
+      if (!defined(contentHandle) || contentHandle.failed) {
+        continue;
+      }
+      const content = contentHandle.tryGetContent();
+      if (!defined(content) || !content.ready) {
+        // No early exit: every active content still needs its request kicked
+        // off, not just the ones before the first unready one.
+        ready = false;
+      }
+    }
+    return ready;
   }
 
   /**
@@ -1979,6 +2015,63 @@ class Conditional3DTileContent {
   }
 
   /**
+   * Returns the contents that are currently drawn AND loaded.
+   *
+   * @type {Cesium3DTileContent[]}
+   * @private
+   */
+  get _displayedLoadedContents() {
+    const displayedContents = [];
+    for (const uri of this._displayedContentUris) {
+      const content = this._contentHandles.get(uri)?.getContentOptional();
+      if (defined(content)) {
+        displayedContents.push(content);
+      }
+    }
+    return displayedContents;
+  }
+
+  /**
+   * Point the drawn contents at what the condition currently selects, once
+   * those have loaded.
+   *
+   * The tile's content state latches to READY after the first successful
+   * load, so the traversal keeps refining into this tile even when the
+   * condition later selects something that is not resident yet. Swapping the
+   * drawn contents only once the new ones are ready keeps the previous ones
+   * up in the meantime, so the tile goes briefly stale instead of empty.
+   *
+   * Requesting the selected contents is driven from here, since this runs
+   * before anything else reads them.
+   *
+   * @private
+   */
+  _updateDisplayedContentUris() {
+    const activeContentUris = this._activeContentUris;
+    if (activeContentUris.length === 0) {
+      // Nothing selected means nothing should be drawn, rather than the
+      // previous contents lingering.
+      this._displayedContentUris = [];
+      return;
+    }
+    let allReady = true;
+    for (const uri of activeContentUris) {
+      const contentHandle = this._contentHandles.get(uri);
+      if (!defined(contentHandle)) {
+        continue;
+      }
+      // Starts the request when there is not one already.
+      const content = contentHandle.tryGetContent();
+      if (!defined(content) || !content.ready) {
+        allReady = false;
+      }
+    }
+    if (allReady) {
+      this._displayedContentUris = activeContentUris;
+    }
+  }
+
+  /**
    * Show the active contents and hide the rest.
    *
    * There is no per-content show flag to drive here: whether a content is
@@ -1991,9 +2084,9 @@ class Conditional3DTileContent {
    * @private
    */
   _applyStylesToContents() {
-    const activeContentUris = new Set(this._activeContentUris);
+    const displayedContentUris = new Set(this._displayedContentUris);
     for (const [uri, contentHandle] of this._contentHandles.entries()) {
-      const style = activeContentUris.has(uri)
+      const style = displayedContentUris.has(uri)
         ? this._lastStyle
         : CONDITIONAL_CONTENT_HIDE_STYLE;
       contentHandle.applyStyleIfChanged(style);
@@ -2014,6 +2107,7 @@ class Conditional3DTileContent {
     // update loop misses it - which leaves a content that first became ready
     // during this frame rendering unstyled, and therefore visible, for a
     // frame.
+    this._updateDisplayedContentUris();
     this._applyStylesToContents();
 
     // Call update for all contents
@@ -2022,7 +2116,7 @@ class Conditional3DTileContent {
     }
 
     // Assign debug settings to all active contents
-    const activeContentsDebug = this._activeLoadedContents;
+    const activeContentsDebug = this._displayedLoadedContents;
     for (const activeContent of activeContentsDebug) {
       // The applyDebugSettings call will override any style color
       // that was previously set. I'm not gonna sort this out.
@@ -2061,21 +2155,26 @@ class Conditional3DTileContent {
       }
     }
 
-    // Mark the "active" contents as "recently used", to prevent
-    // them from being evicted from the loadedContentHandles cache
-    const activeContentUris = this._activeContentUris;
-    for (const activeContentUri of activeContentUris) {
+    // Mark the selected AND currently drawn contents as "recently used", to
+    // prevent them from being evicted from the loadedContentHandles cache.
+    // The drawn ones matter as much as the selected ones: they are what holds
+    // the tile up until the selected ones arrive.
+    const pinnedContentUris = new Set([
+      ...this._activeContentUris,
+      ...this._displayedContentUris,
+    ]);
+    for (const activeContentUri of pinnedContentUris) {
       if (loadedContentHandles.has(activeContentUri)) {
         loadedContentHandles.get(activeContentUri);
       }
     }
 
-    // Ensure that at least the number of active contents
-    // is retained
-    const numActiveContents = activeContentUris.length;
+    // Ensure that at least the pinned contents are retained. That is the
+    // selected ones plus the drawn ones, which can differ while a swap is in
+    // flight - evicting either would defeat the point of keeping them.
     this._loadedContentHandlesMaximumSize = Math.max(
       this._loadedContentHandlesMaximumSize,
-      numActiveContents,
+      pinnedContentUris.size,
     );
 
     // Trim the LRU cache to the target size, calling the
@@ -2105,7 +2204,7 @@ class Conditional3DTileContent {
   pick(ray, frameState, result) {
     let intersection;
     let minDistance = Number.POSITIVE_INFINITY;
-    const contents = this._activeLoadedContents;
+    const contents = this._displayedLoadedContents;
     const length = contents.length;
 
     for (let i = 0; i < length; ++i) {
