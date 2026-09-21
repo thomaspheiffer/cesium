@@ -1141,10 +1141,20 @@ class ContentHandle {
    *
    * @param {Cesium3DTileset} tileset The tileset
    * @param {any} frameState The frame state
+   * @param {boolean} displayed Whether this content is currently drawn
    */
-  updateContent(tileset, frameState) {
+  updateContent(tileset, frameState, displayed) {
     const content = this._content;
     if (!defined(content)) {
+      return;
+    }
+    // A ready content that is not being drawn needs no per-frame update: a
+    // model that is not updated schedules no draw commands, which is exactly
+    // what a hidden variant should do. Every resident variant paying for a
+    // full update is why switching render modes costs more with each switch -
+    // the variants a mode leaves behind stay loaded and keep being updated.
+    // Contents that are not ready still update: that is what loads them.
+    if (!displayed && content.ready) {
       return;
     }
     const oldReady = content.ready;
@@ -2111,8 +2121,13 @@ class Conditional3DTileContent {
     this._applyStylesToContents();
 
     // Call update for all contents
-    for (const contentHandle of this._contentHandles.values()) {
-      contentHandle.updateContent(tileset, frameState);
+    const displayedContentUris = new Set(this._displayedContentUris);
+    for (const [uri, contentHandle] of this._contentHandles.entries()) {
+      contentHandle.updateContent(
+        tileset,
+        frameState,
+        displayedContentUris.has(uri),
+      );
     }
 
     // Assign debug settings to all active contents
