@@ -348,8 +348,16 @@ class RequestHandle {
    *
    * @param {Resource} resource The resource
    */
-  constructor(resource) {
+  constructor(resource, priorityFunction) {
     this._resource = resource;
+
+    /**
+     * Supplies the owning tile's request priority. Without it every variant
+     * request ties, and a leaf's content can be fetched ahead of the root's.
+     *
+     * @type {function():number}
+     */
+    this._priorityFunction = priorityFunction;
 
     /**
      * The actual CesiumJS Request object.
@@ -531,15 +539,15 @@ class RequestHandle {
   /**
    * Create and return the request.
    *
-   * This is similar to what was done in Multiple3DTileContent, except
-   * for the "priority function", which may not be applicable here...
+   * This is similar to what was done in Multiple3DTileContent. The priority
+   * comes from the owning tile, so coarse tiles' contents are fetched before
+   * fine ones - which is what fills a tile in first after the selection
+   * changes.
    *
    * @returns {Request} The request
    */
   _createRequest() {
-    const priorityFunction = () => {
-      return 0;
-    };
+    const priorityFunction = this._priorityFunction ?? (() => 0);
     const request = new Request({
       throttle: true,
       throttleByServer: true,
@@ -953,7 +961,8 @@ class ContentHandle {
     const resource = baseResource.getDerivedResource({
       url: uri,
     });
-    const requestHandle = new RequestHandle(resource);
+    const tile = this._tile;
+    const requestHandle = new RequestHandle(resource, () => tile._priority);
     this._requestHandle = requestHandle;
 
     // Attach any request listeners that have already been added
@@ -981,8 +990,11 @@ class ContentHandle {
           console.log(
             `ContentHandle: Content creation for ${uri} caused error ${error}`,
           );
-          this._failed = true;
         }
+        // Outside the logging guard: a handle whose content failed to build
+        // never produces content and never retries, so callers that wait on it
+        // would wait forever.
+        this._failed = true;
 
         // The promise is only intended for testing, and may not be awaited,
         // so it cannot be rejected without causing an uncaught error.
@@ -2042,14 +2054,13 @@ class Conditional3DTileContent {
   }
 
   /**
-   * Point the drawn contents at what the condition currently selects, once
-   * those have loaded.
+   * Point the drawn contents at what the condition currently selects.
    *
-   * The tile's content state latches to READY after the first successful
-   * load, so the traversal keeps refining into this tile even when the
-   * condition later selects something that is not resident yet. Swapping the
-   * drawn contents only once the new ones are ready keeps the previous ones
-   * up in the meantime, so the tile goes briefly stale instead of empty.
+   * Only the selected contents are drawn. A selected content that has not
+   * loaded yet leaves the tile empty until it arrives, rather than the
+   * previously drawn one standing in: a hole reads as "still loading", whereas
+   * geometry from a timestamp the condition did not select misrepresents what
+   * the viewer is showing.
    *
    * Requesting the selected contents is driven from here, since this runs
    * before anything else reads them.
@@ -2058,27 +2069,11 @@ class Conditional3DTileContent {
    */
   _updateDisplayedContentUris() {
     const activeContentUris = this._activeContentUris;
-    if (activeContentUris.length === 0) {
-      // Nothing selected means nothing should be drawn, rather than the
-      // previous contents lingering.
-      this._displayedContentUris = [];
-      return;
-    }
-    let allReady = true;
     for (const uri of activeContentUris) {
-      const contentHandle = this._contentHandles.get(uri);
-      if (!defined(contentHandle)) {
-        continue;
-      }
       // Starts the request when there is not one already.
-      const content = contentHandle.tryGetContent();
-      if (!defined(content) || !content.ready) {
-        allReady = false;
-      }
+      this._contentHandles.get(uri)?.tryGetContent();
     }
-    if (allReady) {
-      this._displayedContentUris = activeContentUris;
-    }
+    this._displayedContentUris = activeContentUris;
   }
 
   /**
